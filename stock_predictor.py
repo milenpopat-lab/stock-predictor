@@ -1,7 +1,6 @@
 import streamlit as st
 from datetime import date
 
-import numpy as np
 import pandas as pd
 import yfinance as yf
 from prophet import Prophet
@@ -22,6 +21,7 @@ period = n_years * 365
 
 @st.cache_data
 def load_data(ticker: str) -> pd.DataFrame:
+    """Download historical prices from yfinance and normalize the columns."""
     df = yf.download(
         ticker,
         start=START,
@@ -29,11 +29,19 @@ def load_data(ticker: str) -> pd.DataFrame:
         progress=False,
         auto_adjust=False,
         group_by="column",
+        threads=False,
     )
+
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     df = df.reset_index()
 
-    # If yfinance returns MultiIndex columns, flatten them
+    # yfinance sometimes uses "index" instead of "Date" after reset_index
+    if "index" in df.columns and "Date" not in df.columns:
+        df = df.rename(columns={"index": "Date"})
+
+    # Flatten MultiIndex columns if present
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [
             "_".join([str(x) for x in col if x is not None and str(x) != ""])
@@ -45,26 +53,26 @@ def load_data(ticker: str) -> pd.DataFrame:
     return df
 
 
+def _candidate_cols(df: pd.DataFrame, col_name: str) -> list[str]:
+    """Find columns that likely correspond to col_name (handles flattened/multiindex names)."""
+    n = col_name.lower()
+    cols: list[str] = []
+    for c in df.columns:
+        s = str(c).lower()
+        if s == n or s.endswith(f"_{n}") or s.startswith(f"{n}_") or (n in s):
+            cols.append(c)
+    return cols
+
+
 def pick_1d_series(df: pd.DataFrame, col_name: str) -> pd.Series:
-    """
-    Always return a 1-D Series for the requested column name.
-    Handles duplicate col names / multiindex flattening edge cases.
-    """
+    """Return a 1-D Series for the requested column name."""
     if col_name in df.columns:
         obj = df[col_name]
         if isinstance(obj, pd.DataFrame):
             return obj.iloc[:, 0]
         return obj
 
-    # Try common flattened patterns (Close_AAPL, AAPL_Close, etc.)
-    n = col_name.lower()
-    candidates = [
-        c for c in df.columns
-        if str(c).lower() == n
-        or str(c).lower().endswith(f"_{n}")
-        or str(c).lower().startswith(f"{n}_")
-        or n in str(c).lower()
-    ]
+    candidates = _candidate_cols(df, col_name)
     if not candidates:
         raise KeyError(f"Could not find '{col_name}' in columns: {list(df.columns)}")
 
@@ -74,9 +82,47 @@ def pick_1d_series(df: pd.DataFrame, col_name: str) -> pd.Series:
     return obj
 
 
+def pick_numeric_series(df: pd.DataFrame, col_name: str) -> pd.Series:
+    """Return a numeric (coerced) 1-D Series for the requested column name."""
+    candidates: list[str] = []
+    if col_name in df.columns:
+        candidates.append(col_name)
+    candidates.extend([c for c in _candidate_cols(df, col_name) if c not in candidates])
+
+    if not candidates:
+        raise KeyError(f"Could not find '{col_name}' in columns: {list(df.columns)}")
+
+    best: pd.Series | None = None
+    best_non_nan = -1
+
+    for c in candidates:
+        obj = df[c]
+        s = obj.iloc[:, 0] if isinstance(obj, pd.DataFrame) else obj
+        s_num = pd.to_numeric(s, errors="coerce")
+        non_nan = int(s_num.notna().sum())
+
+        if non_nan > best_non_nan:
+            best_non_nan = non_nan
+            best = s_num
+
+        # Stop early if we found a clearly usable series
+        if non_nan >= 10:
+            return s_num
+
+    # Fall back to the best we saw
+    return best if best is not None else pd.Series(dtype="float64")
+
+
 data_load_state = st.text("Loading data...")
 data = load_data(selected_stock)
 data_load_state.text("Loading data... done!")
+
+if data.empty:
+    st.error(
+        "No data was returned from yfinance. This can happen due to rate limits or network issues.\n\n"
+        "Try again in a minute, or try a different ticker."
+    )
+    st.stop()
 
 st.subheader("Raw data")
 st.write(data.tail())
@@ -85,17 +131,18 @@ with st.expander("Debug: columns from yfinance"):
     st.write(list(data.columns))
 
 
-# Plot raw data
 def plot_raw_data():
-    # yfinance usually gives "Date" after reset_index, but sometimes it can be "Datetime"
-    date_col = "Date" if "Date" in data.columns else ("Datetime" if "Datetime" in data.columns else data.columns[0])
+    date_col = "Date" if "Date" in data.columns else (
+        "Datetime" if "Datetime" in data.columns else data.columns[0]
+    )
 
-    open_s = pick_1d_series(data, "Open")
-    close_s = pick_1d_series(data, "Close")
+    x = pd.to_datetime(data[date_col], errors="coerce")
+    open_s = pick_numeric_series(data, "Open")
+    close_s = pick_numeric_series(data, "Close")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=data[date_col], y=open_s, name="stock_open"))
-    fig.add_trace(go.Scatter(x=data[date_col], y=close_s, name="stock_close"))
+    fig.add_trace(go.Scatter(x=x, y=open_s, name="stock_open"))
+    fig.add_trace(go.Scatter(x=x, y=close_s, name="stock_close"))
     fig.update_layout(
         title_text="Time Series data with Rangeslider",
         xaxis_rangeslider_visible=True,
@@ -106,32 +153,33 @@ def plot_raw_data():
 plot_raw_data()
 
 # -------------------------
-# Forecast with Prophet (HARDENED: guarantees ds/y are 1-D and no duplicate 'y' column)
+# Forecast with Prophet (robust + guarded)
 # -------------------------
-date_col = "Date" if "Date" in data.columns else ("Datetime" if "Datetime" in data.columns else data.columns[0])
+date_col = "Date" if "Date" in data.columns else (
+    "Datetime" if "Datetime" in data.columns else data.columns[0]
+)
 
-ds_series = pick_1d_series(data, date_col)
-close_series = pick_1d_series(data, "Close")
+ds = pd.to_datetime(data[date_col], errors="coerce")
+y = pick_numeric_series(data, "Close")
 
-# Convert to 1-D numpy arrays explicitly (this avoids pandas returning DataFrames on duplicate names)
-ds_arr = pd.to_datetime(np.asarray(ds_series).reshape(-1), errors="coerce")
-y_arr = pd.to_numeric(np.asarray(close_series).reshape(-1), errors="coerce")
-
-# Build df_train from arrays so it can only have ONE 'y' column
-df_train = pd.DataFrame({"ds": ds_arr, "y": y_arr}).dropna()
-
-# Force columns to be exactly ['ds','y'] (no duplicates, no extras)
+df_train = pd.DataFrame({"ds": ds, "y": y}).dropna()
 df_train = df_train.loc[:, ["ds", "y"]].copy()
-df_train.columns = ["ds", "y"]
 
-# Remove duplicate timestamps (Prophet prefers unique ds)
+# Remove duplicate timestamps (Prophet doesn't like duplicates)
 df_train = df_train.groupby("ds", as_index=False)["y"].mean()
 
-with st.expander("Debug: Prophet training df (should be 2 cols: ds,y)"):
-    st.write("columns:", list(df_train.columns))
-    st.write("type(df_train['y']):", type(df_train["y"]))
+with st.expander("Debug: Prophet training df"):
+    st.write("rows:", len(df_train))
     st.write(df_train.dtypes)
     st.write(df_train.head())
+    st.write(df_train.tail())
+
+if len(df_train) < 2:
+    st.error(
+        "Not enough non-NaN rows to train Prophet (need at least 2).\n\n"
+        "This usually happens when the date column can't be parsed, or Close prices couldn't be converted to numbers."
+    )
+    st.stop()
 
 m = Prophet()
 m.fit(df_train)
